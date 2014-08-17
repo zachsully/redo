@@ -1,0 +1,30 @@
+name:                redo
+version:             0.0.1.0
+synopsis:            A program for rebuilding out of date targets from build scripts.
+-- description:         
+license:             BSD3
+license-file:        LICENSE
+author:              Zach Sullivan
+maintainer:          zachsully@gmail.com
+-- copyright:           
+category:            Development
+build-type:          Simple
+cabal-version:       >=1.8
+
+executable redo
+  main-is:	       redo.hs
+  ghc-options:         -threaded
+                       -O2
+                       -rtsopts
+  -- other-modules:       
+  build-depends:       base ==4.5.*,
+                       bytestring,
+                       cond,
+                       directory,
+                       filepath,
+                       mtl,
+                       monad-parallel,
+                       process,
+                       pureMD5,
+                       stm,
+                       transformers

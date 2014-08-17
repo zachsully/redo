@@ -1,0 +1,70 @@
+." This is the man page for redo
+
+.TH redo 1 "Zach Sullivan" "Version 0.0.1.0"
+
+.SH NAME
+.B redo
+for top down software rebuilding
+
+.SH SYNOPSIS
+.B redo
+[-OPTIONS] [
+.I filename
+]
+
+.SH DESCRIPTION
+Running
+.B redo
+on a target will bring a it up to date. This is done through the use of build
+scripts written in shell syntax. These build scripts are named with a 
+.I .do
+file extension.
+.PP
+.B redo
+has several features that bring targets up to date effeciently and safely by the following:
+.PP
+> not running scripts unless dependencies have changed
+.PP
+> atomically building targets
+.PP
+> checking dependencies with md5 checksums
+.PP
+.B redo-ifchange
+and
+.B redo-ifcreate
+are placed into these builds scripts and are used as a guard,
+only running the rest of the script if their arguments (the targets's dependancies) are out of
+date. Up-to-date-ness is determined by md5 checksums.
+
+.SH OPTIONS
+.IP "-c  --concurrent"
+.B redo
+targets and check dependencies concurrently
+.IP "-f  --force"
+.B redo
+everything, disregarding if the dependencies are up to date
+.IP "-h  --help"
+display this help and exit
+.IP "-q  --quiet"
+hides all output
+.IP "-v  --verbose"
+displays shell commands that are executed and extra debug information
+.IP "-V  --version"
+display version and exit
+
+.SH BUGS
+
+.IP "version flag"
+This isn't working correctly. I would prefer to pull it straight from the redo.cabal file
+so it is only kept in one place.
+.IP "concurrency"
+Concurrency still has yet to be implemented. Plan on using software transactional memory.
+
+.SH AUTHOR
+Zach Sullivan
+.I zachsully@gmail.com
+
+.SH ACKNOWLEDGEMENTS
+Thanks to the other redo implementations on github, especially Jekor's implementation which is
+in Haskell. Thanks to Alan Grosskurth for his thesis "Purely top-down software rebuilding" about
+redo and software manufacture. And thanks to D.J. Bernstein for the original conception.

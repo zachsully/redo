@@ -1,0 +1,193 @@
+{-
+Filename: redo.hs
+Part of: redo
+Created by: Zach Sullivan
+Created on: 06/24/2014
+Last Modified by: Zach Sullivan
+Last Modified on: 08/03/2014
+
+Redo runs build scripts
+-}
+
+import Control.Exception.Base (evaluate)
+import Control.Monad (liftM, when, unless)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Reader (ask, ReaderT, runReaderT)
+import Control.Conditional (ifM, whenM)
+import qualified Data.ByteString.Lazy as BS (readFile)
+import Data.Digest.Pure.MD5 (md5)
+import Data.Map (fromList, lookup, toList) -- remember to remove from cabal file if it doesn't work out
+import Data.Version (parseVersion, showVersion) -- not currently using these
+import System.Console.GetOpt (OptDescr (..), ArgDescr (NoArg), ArgOrder (Permute), getOpt)
+import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile, renameFile)
+import System.Environment (getArgs, getEnv, getEnvironment, getProgName)
+import System.Exit (ExitCode (..), exitWith)
+import System.FilePath.Posix (takeExtension)
+import System.IO (hClose, hFlush, hGetContents, hPutStr, hPutStrLn, IOMode (..), openFile, stderr, withFile)
+import System.Process (CreateProcess (..), createProcess, shell, waitForProcess)
+import Text.ParserCombinators.ReadP (readP_to_S)
+
+data Opts = Force
+          | Help
+          | Parallel -- FIX
+          | Quiet
+          | Verbose
+          | Version --FIX
+          deriving (Eq, Read, Show)
+                   
+type Target = String                   
+type Dep = String
+                   
+---------------------------------------------------------------------------------------------------------
+
+main :: IO ()
+main  = do
+  prog <- getProgName
+  case prog of 
+    -- redo will run the doFile of its arg
+    "redo" -> do (options, targets, errs) <- (getOpt Permute optionsList) `liftM` getArgs
+                 applyInitOptions (options, errs)
+                 mapM_ (\t -> runReaderT (exeDoFile t) options) targets -- runs do files with options
+                 
+    -- THESE ARE MEANT TO RUN INSIDE A TARGETS DOFILE                 
+    "redo-ifchange" -> redoIfChange =<< getArgs
+    "redo-ifcreate" -> redoIfCreate =<< getArgs
+    
+------------------------------------------------------------------------------------------
+
+-- | takes a list of dependances, exits ExitFailure 12 if deps are up to date
+redoIfChange :: [Dep] -> IO ()                 
+redoIfChange deps = do
+  options <- read `liftM` getEnv "REDO_OPTIONS"
+  out <- processOutput `liftM` mapM (\dep -> do code <- ifM (doesFileExist $ doFile dep) 
+                                                            (runReaderT (exeDoFile dep) options) 
+                                                            (return ExitSuccess)
+                                                return (code, dep)) deps
+  when (elem Force options) $ exitWith ExitSuccess -- if force option ExitSuccess, continue do file
+  if (fst out) == ExitSuccess || (fst out) == ExitFailure 12
+    then do changes <- mapM updateSumIfChange deps
+            if all (== False) changes
+              then exitWith $ ExitFailure 12
+              else exitWith ExitSuccess
+    else exitWith $ fst out
+  where updateSumIfChange dep = do
+          target <- getEnv "REDO_TARGET"
+          change <- hasChanged target dep
+          when change $ updateSum target dep
+          return change  
+                 
+redoIfCreate :: [Dep] -> IO ()
+redoIfCreate deps = do
+  created <- mapM doesFileExist deps
+  if all (== False) created
+    then exitWith $ ExitFailure 12
+    else return ()
+         
+----------------------------------------------------------------------------------------
+  
+-- | takes parsed options and applies the ones that are meant to run initially
+applyInitOptions :: ([Opts], [String]) -> IO ()               
+applyInitOptions (options, errs) = do   
+  when (elem Help options) (do hPutStrLn stderr =<< readFile "README.md" 
+                               exitWith ExitSuccess)
+--  when (elem Version options) (let f = readP_to_S parseVersion)
+  when (elem Verbose options) $ hPutStrLn stderr $ show options
+  when (errs /= []) (do hPutStr stderr $ concat errs
+                        exitWith $ ExitFailure 2)  
+
+-- | takes a target and a dependency and returns the filepath to the dependancy checksum
+checksumFile :: Target -> Dep -> FilePath
+checksumFile  = \target dep -> concat [".redo/", target, "/", dep, ".sum"]
+
+-- | takes a target and a dependency and returns the filepath to the dependancy checksum
+oldChecksumFile :: Target -> Dep -> FilePath
+oldChecksumFile  = \target dep -> concat [".redo/", target, "/", dep, ".sum"]
+
+-- | takes a target and a dependency and returns the filepath to the dependancy checksum
+newChecksumFile :: Target -> Dep -> FilePath
+newChecksumFile  = \target dep -> concat [".redo/", target, "/", dep, ".sum"]
+
+-- | takes a target and returns the filepath to it's doFile (build script)
+doFile :: Target -> FilePath
+doFile  = \target -> target ++ ".do"
+
+-- | takes a target and runs it's doFile with certain cmd Options, returning the exitCode of the target
+exeDoFile :: Target -> ReaderT [Opts] IO ExitCode
+exeDoFile target = do
+  options <- ask
+  liftIO $ do
+    newEnv <- (++ [("REDO_TARGET", target), ("REDO_OPTIONS", show options)]) `liftM` getEnvironment
+    (_,_,_,ph) <- createProcess $ (shell $ unwords ["sh"
+                                                   , if elem Verbose options then "-e -v" else "-e"
+                                                   , doFile target, "0", target, tmpFile]) {env = Just newEnv}
+    code <- waitForProcess ph
+    manageTmpFile code
+    unless (elem Quiet options) $ printout code
+    return code
+  where tmpFile = target ++ "---redoing"
+        manageTmpFile c = whenM (doesFileExist tmpFile)
+                                (if c == ExitSuccess
+                                 then renameFile tmpFile target
+                                 else removeFile tmpFile) 
+        printout c = case c of
+          ExitSuccess    -> hPutStrLn stderr $ target ++ " redone"
+          ExitFailure 12 -> hPutStrLn stderr $ target ++ " up to date"
+          ExitFailure x  -> hPutStrLn stderr $ target ++ " failed to redo, code: " ++ (show x)
+
+
+-- | takes a file and returns it's md5 as a string
+getMD5 :: FilePath -> IO String
+getMD5  = \path -> (show . md5) `liftM` BS.readFile path
+
+-- | takes a target and a dependency and returns True if the target has changed or is missing
+hasChanged :: Target -> Dep -> IO Bool
+hasChanged target dep = do
+  trueUnlessM (doesFileExist $ checksumFile target dep)
+    $ trueUnlessM (doesFileExist dep)
+      $ do sum <- getMD5 dep
+           withFile (checksumFile target dep) ReadMode (\h -> evaluate =<< (sum /=) `liftM` hGetContents h)
+  where trueUnlessM :: Monad m => m Bool -> m Bool -> m Bool
+        trueUnlessM bool expr = bool >>= (\inp -> if inp then expr else return True)
+        
+-- | Available options
+optionsList :: [OptDescr Opts]
+optionsList  = [ Option ['f'] ["force"] (NoArg Force) "Force redo, even if up to date"
+               , Option ['h'] ["help"] (NoArg Help) "Show help dialog"
+               , Option ['p'] ["parallel"] (NoArg Parallel) "evalutate targets and dependencies in parallel"
+               , Option ['q'] ["quiet"] (NoArg Quiet) "Hides output"
+               , Option ['v'] ["verbose"] (NoArg Verbose) "Print extra information"
+               , Option ['V'] ["version"] (NoArg Version) "Show version information from cabal file"]
+               
+-- | takes a list of code, target pairs and returns the first pair with an error, else the first pair
+processOutput :: [(ExitCode, String)] -> (ExitCode, String)               
+processOutput (last: []) = last
+processOutput (current:rest) = if (fst current) == ExitSuccess
+                               then processOutput rest
+                               else current
+
+-- | takes a dependancy and updates its checksum
+updateSum :: Target -> Dep -> IO ()
+updateSum target dep = do
+  createDirectoryIfMissing True $ concat [".redo/", target, "/"]
+  writeFile (checksumFile target dep) =<< getMD5 dep
+
+{- 
+To Do:
+
+1. Exit build script when there is an error PRIORITY -- still not working
+     Note: to get this to work properly, redo-ifchange can't update dependencies until doFile has
+           finished executing
+2. Checking of dependancies in PARALLEL
+3. default.*.do directory
+4. Further code optimization
+-}
+
+
+{-
+PLAN to not update deps if build script doesnt work out
+
+when checking sums, check dep.oldsum vs dep.newsum
+
+after the doScript exits, mv dep.newsum dep.oldsum if exit was successful
+
+-}

@@ -26,7 +26,7 @@ on with the build script.
 
 * *Abstract Targets* -
   Since abstract targets do not build an actual target file, **redo-ifchange**
-  will just recurse by calling the abstract target's build script.
+  will just recurse by calling the abstract target's build script. 
 
 * *Concrete Targets* -
   **redo-ifchange** will recurse calling the build script of a concrete target.

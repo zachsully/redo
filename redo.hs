@@ -4,7 +4,7 @@ Part of: redo
 Created by: Zach Sullivan
 Created on: 06/24/2014
 Last Modified by: Zach Sullivan
-Last Modified on: 08/13/2014
+Last Modified on: 08/28/2014
 
 Redo runs build scripts
 -}
@@ -25,30 +25,16 @@ import System.Environment (getArgs, getEnv, getEnvironment, getProgName)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath.Posix (takeBaseName, takeExtension)
 import System.IO (hClose, hFlush, hGetContents, hPutStr, hPutStrLn, IOMode (..), openFile, stderr, withFile)
+import System.IO.Error (ioError, userError)
 import System.Process (CreateProcess (..), createProcess, shell, waitForProcess)
 
-data Opts = Concurrent -- FIX THIS
+data Opts = Concurrent -- NOT IMPLEMENTED
           | Force
           | Help
           | Quiet
           | Verbose
-          | Version -- FIX THIS
+          | Version -- NOT IMPLEMENTED
           deriving (Eq, Read, Show)
-                   
-type Source = FilePath
-
-data Target = Abstract FilePath
-            | Concrete FilePath FilePath
-
-data Dependency = Source
-                | Target
-                deriving (Show, Eq, Ord)
-                         
--- instance Read (IO Dependency) where
-
--- these types are defined for the credo-ifchange                         
-type ExecutingDo = TVar Bool
-type List = TVar [ExitCode]
 
 ---------------------------------------------------------------------------------------------------------
 
@@ -56,7 +42,6 @@ main :: IO ()
 main  = do
   prog <- getProgName
   case prog of 
-    -- redo will run the doFile of its arg
     "redo" -> do (options, targets, errs) <- (getOpt Permute optionsList) `liftM` getArgs
                  applyInitOptions (options, errs)
                  mapM_ (\t -> runReaderT (exeDoFile t) options) targets
@@ -80,12 +65,7 @@ redoIfChange deps = do
               then exitWith $ ExitFailure 12
               else exitWith ExitSuccess
     else exitWith $ fst out
-  where exeDoFile' options dep = do
-          code <- ifM (doesFileExist $ doFile dep) 
-                      (runReaderT (exeDoFile dep) options) 
-                      (return ExitSuccess)
-          return (code, dep)
-                 
+
 redoIfCreate :: [String] -> IO ()
 redoIfCreate deps = do
   created <- mapM doesFileExist deps
@@ -104,7 +84,6 @@ applyInitOptions (options, errs) = do
                         exitWith $ ExitFailure 2)
   when (elem Help options) (do hPutStrLn stderr =<< readFile "README.md"
                                exitWith ExitSuccess)
---  when (elem Version options) (let f = readP_to_S parseVersion)
   when (elem Verbose options) $ hPutStrLn stderr showOpts
   where showOpts = "redo invoked with" ++ (tail $ foldr (\o rest -> ", " ++ o ++ rest) " flag(s).\n" $ map show options)
 
@@ -129,7 +108,7 @@ exeDoFile target = do
     code <- waitForProcess ph
     manageTmpFile code
     unless (elem Quiet options) $ printout code
-    when (code == ExitSuccess) $ updateSums target
+    when (code == ExitSuccess) $ updateTargetSums target
     return code
   where cmd opts = unwords ["sh", if elem Verbose opts then "-e -v" else "-e"
                            , doFile target, "0", target, tmpFile]
@@ -142,7 +121,20 @@ exeDoFile target = do
           ExitSuccess    -> hPutStrLn stderr $ target ++ " redone"
           ExitFailure 12 -> hPutStrLn stderr $ target ++ " up to date"
           ExitFailure x  -> hPutStrLn stderr $ target ++ " failed to redo, code: " ++ (show x)
-
+          
+----------- FOR CONCURRENCY UPDATE || NOT WORKING
+exeDoFile' options dep = do
+  code <- ifM (doesFileExist $ doFile dep) 
+          (runReaderT (exeDoFile dep) options)
+          (return ExitSuccess)
+  return (code, dep)
+        
+--exeDoFileC :: TVar (IO [(ExitCode, String)]) -> [Opts] -> String -> IO ()  
+exeDoFileC var options dep = atomically $ do
+  let result = exeDoFile' options dep
+  results <- readTVar var
+  writeTVar var (result:results)
+-----------  
 
 -- | takes a file and returns it's md5 as a string
 getMD5 :: FilePath -> IO String
@@ -182,8 +174,8 @@ sumDirectory :: String -> FilePath
 sumDirectory  = \target -> concat [".redo/", target, "/"]
 
 -- | replaces oldsums with newsum in dependency database
-updateSums :: String -> IO ()
-updateSums target = do
+updateTargetSums :: String -> IO ()
+updateTargetSums target = do
   let directory = sumDirectory target
   contents <- getDirectoryContents directory
   mapM_ (\file -> case takeExtension file of
@@ -198,4 +190,122 @@ To Do:
 3. Option for redo-ifchange
     that says if a target is abstract, meaning that it does not build a particular file
 ALWAYS - Further code optimization
+
+4. Cache working source files to allow people to revert to last running state
 -}
+
+type SourceFile = FilePath
+type DoFile     = FilePath
+type TargetFile = FilePath
+
+data Dependency = Source SourceFile
+                | Target DoFile (Maybe TargetFile)
+                deriving (Show, Eq)
+                         
+-- | get's args and options and initially dispatches them
+mainN :: IO ()
+mainN  = do
+  prog <- getProgName
+  case prog of
+    "redo" -> do (options, args, errs) <- (getOpt Permute optionsList) `liftM` getArgs
+                 applyInitOptions (options, errs)
+                 mapM_ (\a -> do a' <- parseDependency a
+                                 runReaderT (redo a') options) args
+    "redo-ifchange" -> redoifchange =<< (mapM parseDependency) =<< getArgs
+    "redo-ifcreate" -> redoifcreate =<< getArgs
+    
+-- | takes a target, executes DoFile, manages temporary files, updates checksums, and exits with appropriate exitcode
+redo :: Dependency -> ReaderT [Opts] IO ExitCode
+redo (Source _) = liftIO $ exitWith ExitSuccess
+redo (Target doFile maybeTargetFile) = do
+  options <- ask
+  liftIO $ do
+    createDirectoryIfMissing True $ sumDirectory target -- is this the right place to be doing this?
+    newEnv <- (++ [("REDO_TARGET", target), ("REDO_OPTIONS", show options)]) `liftM` getEnvironment
+    (_,_,_,ph) <- createProcess $ (shell $ cmd options) {env = Just newEnv}
+    code <- waitForProcess ph
+    unless (elem Quiet options) $ printout code
+    when (code == ExitSuccess) $ updateTargetSums target
+    case maybeTargetFile of
+      Nothing         -> return code
+      Just targetFile -> if code == ExitSuccess
+                         then (renameFile tmpFile targetFile) >> return code 
+                         else (removeFile tmpFile) >> return code
+  where cmd opts = unwords ["sh", if elem Verbose opts then "-e -v" else "-e"
+                           , doFile, "0", target, tmpFile]
+        tmpFile = target ++ "---redoing"
+        target = takeBaseName doFile
+        printout c = case c of
+          ExitSuccess    -> hPutStrLn stderr $ target ++ " redone"
+          ExitFailure 12 -> hPutStrLn stderr $ target ++ " up to date"
+          ExitFailure x  -> hPutStrLn stderr $ target ++ " failed to redo, code: " ++ (show x)
+
+-- | takes a list of deps, calls redo of Targets, and checks the sums exiting with the appropriate exitcode
+redoifchange :: [Dependency] -> IO ()
+redoifchange deps = do
+  options <- read `liftM` getEnv "REDO_OPTIONS"
+  out <- forM deps (\d -> do code <- runReaderT (redo d) options
+                             return (code, d))
+  let errs = filter (\(c,_) -> c /= ExitSuccess || c /= ExitFailure 12) out
+  unless (errs == []) $ exitWith $ ExitFailure 99
+  when (elem Force options) $ exitWith ExitSuccess
+{-
+-- | takes a list of dependances, exits ExitFailure 12 if deps are up to date
+redoIfChange :: [String] -> IO ()
+redoIfChange deps = do
+  options <- read `liftM` getEnv "REDO_OPTIONS"
+  out <- processOutput `liftM` mapM (exeDoFile' options) deps
+  when (elem Force options) $ exitWith ExitSuccess -- if Force option ExitSuccess, continue do file
+  if (fst out) == ExitSuccess || (fst out) == ExitFailure 12
+    then do changes <- mapM hasChanged deps
+            when (elem Verbose options) $ hPutStrLn stderr $ show changes
+            if all (== False) changes
+              then exitWith $ ExitFailure 12
+              else exitWith ExitSuccess
+    else exitWith $ fst out
+-}
+-- | takes a list of files, exiting with ExitFailure 12 if it couldn't find files in current directory
+redoifcreate :: [FilePath] -> IO ()
+redoifcreate files = do
+  bools <- mapM doesFileExist files
+  if any id bools
+    then exitWith ExitSuccess
+    else exitWith $ ExitFailure 11
+
+parseDependency :: String -> IO Dependency
+parseDependency input = do
+  let depDo = doFile input
+  hasDo <- doesFileExist depDo
+  exists <- doesFileExist input
+  case (hasDo, exists) of
+    (True, True)   -> return (Target depDo (Just input))
+    (True, False)  -> return (Target depDo Nothing)
+    (False, True)  -> return (Source input)
+    (False, False) -> ioError $ userError $ "'" ++ input ++ "' is not a valid redo candidate"
+
+isUpToDate :: Dependency -> IO Bool    
+isUpToDate dep = do
+  target <- parseDependency =<< getEnv "REDO_TARGET"
+  let oldsumFile = oldChecksumFile target dep
+  newsum <- getMD5 $ case dep of (Source path)          -> path
+                                 (Target _ (Just path)) -> path
+                                 (Target x Nothing)     -> ioError $ userError $ "'" ++ x ++ "' is not a concrete dependency"
+  writeFile (newChecksumFile target dep) newsum
+  return True
+
+{-  
+-- | takes a target and a dependency and returns True if the target has changed or is missing
+hasChanged :: String -> IO Bool
+hasChanged dep = do
+  -- let
+  target <- getEnv "REDO_TARGET"
+  newsum <- getMD5 dep
+  let oldsumFile = oldChecksumFile target dep
+  -- in
+  writeFile (newChecksumFile target dep) newsum
+  trueUnlessM (doesFileExist oldsumFile)
+    $ trueUnlessM (doesFileExist dep)
+      $ withFile oldsumFile ReadMode (\h -> evaluate =<< (newsum /=) `liftM` hGetContents h)
+  where trueUnlessM :: Monad m => m Bool -> m Bool -> m Bool
+        trueUnlessM bool expr = bool >>= (\inp -> if inp then expr else return True)
+-}    
